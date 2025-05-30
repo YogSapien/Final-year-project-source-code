@@ -1,0 +1,120 @@
+//KINDLE COPY AND PASTE THIS IN GOOGLE EARTH ENGINE TO RUN
+
+
+
+// STEP 1: Load study area boundary
+var boundary = ee.FeatureCollection("projects/ee-nyogeshwar003/assets/nilagiri_shp_fin");
+
+// STEP 2: Load raster parameters from Assets (all reclassified)
+var slope = ee.Image("projects/ee-nyogeshwar003/assets/SLOPENIL");
+var aspect = ee.Image("projects/ee-nyogeshwar003/assets/ASPECTNIL");
+var ndvi = ee.Image("projects/ee-nyogeshwar003/assets/NDVI");
+var lulc = ee.Image("projects/ee-nyogeshwar003/assets/LULC1");
+var rainfall = ee.Image("projects/ee-nyogeshwar003/assets/RAINFALL1");
+var geomorph = ee.Image("projects/ee-nyogeshwar003/assets/GEOMORPH1");
+var lithology = ee.Image("projects/ee-nyogeshwar003/assets/LITH1");
+var soil = ee.Image("projects/ee-nyogeshwar003/assets/SOIL1");
+
+// STEP 3: Load vector layers
+var roads = ee.FeatureCollection("projects/ee-nyogeshwar003/assets/Road");
+var streams = ee.FeatureCollection("projects/ee-nyogeshwar003/assets/Streams");
+var faults = ee.FeatureCollection("projects/ee-nyogeshwar003/assets/Faults");
+
+// Rasterize function (no buffer for distance calculation)
+var rasterize_binary = function(fc, bandName) {
+    return fc.map(function(f) { return f.set('value', 1); })
+             .reduceToImage({
+                 properties: ['value'],
+                 reducer: ee.Reducer.first()
+             }).rename(bandName).unmask(0);
+};
+
+var roadRasterBinary = rasterize_binary(roads, 'roads_binary');
+var streamRasterBinary = rasterize_binary(streams, 'streams_binary');
+var faultRasterBinary = rasterize_binary(faults, 'faults_binary');
+
+// Create distance rasters using fastDistanceTransform
+var roadDistance = roadRasterBinary.fastDistanceTransform().rename('roads_distance').clip(boundary);
+var streamDistance = streamRasterBinary.fastDistanceTransform().rename('streams_distance').clip(boundary);
+var faultDistance = faultRasterBinary.fastDistanceTransform().rename('faults_distance').clip(boundary);
+
+// STEP 4: Combine all input layers and clip to the boundary
+var inputBands = slope
+    .addBands([aspect, ndvi, lulc, rainfall, geomorph, lithology, soil,
+               roadDistance, streamDistance, faultDistance
+              ]).clip(boundary);
+
+// STEP 5: Load landslide inventory points (label = 1)
+var ls_points = ee.FeatureCollection("projects/ee-nyogeshwar003/assets/LandslideLocations")
+    .map(function(f){ return f.set('class', 1); });
+
+// STEP 6: Generate random non-landslide points (label = 0)
+var non_ls = ee.FeatureCollection.randomPoints(boundary, 300, 1234)
+    .map(function(f){ return f.set('class', 0); });
+
+// Merge training points
+var training_points = ls_points.merge(non_ls);
+
+// STEP 7: Sample raster values at point locations
+var training = inputBands.sampleRegions({
+    collection: training_points,
+    properties: ['class'],
+    scale: 30
+});
+
+// STEP 8: Split into training/testing
+var withRandom = training.randomColumn('random', 1234);
+var trainData = withRandom.filter(ee.Filter.lt('random', 0.7));
+var testData = withRandom.filter(ee.Filter.gte('random', 0.7));
+
+// STEP 9: Train Random Forest classifier
+var classifier = ee.Classifier.smileRandomForest(50).train({
+    features: trainData,
+    classProperty: 'class',
+    inputProperties: inputBands.bandNames()
+});
+
+// STEP 10: Accuracy Assessment
+var validated = testData.classify(classifier);
+var confusionMatrix = validated.errorMatrix('class', 'classification');
+print('Confusion Matrix:', confusionMatrix);
+print('Overall Accuracy:', confusionMatrix.accuracy());
+print('Kappa Coefficient:', confusionMatrix.kappa());
+
+// STEP 11: Feature Importance (optional)
+var importance = ee.Dictionary(classifier.explain().get('importance'));
+print('Feature Importance:', importance);
+
+// STEP 12: Classify the full image using PROBABILITY mode
+var probability = inputBands.classify(classifier.setOutputMode('PROBABILITY')).clip(boundary);
+
+// STEP 13: Reclassify probability (0 to 1) to 5 classes
+var reclass = probability.expression(
+    "(b(0) <= 0.15) ? 1" +   // Very Low
+    " : (b(0) <= 0.35) ? 2" +   // Low
+    " : (b(0) <= 0.60) ? 3" +   // Moderate
+    " : (b(0) <= 0.80) ? 4" +   // High
+    " : 5"                      // Very High
+).rename('LS_5_Class');
+
+// STEP 14: Visualization
+var palette = ['green', 'lime', 'yellow', 'orange', 'red'];
+Map.centerObject(boundary, 10);
+var maskedReclass = reclass.updateMask(ee.Image.constant(1).clip(boundary));
+Map.addLayer(maskedReclass, {min: 1, max: 5, palette: palette}, 'Landslide Susceptibility (RF)');
+
+// Optional: Visualize the probability layer to help with threshold selection
+var probabilityPalette = ['00FF00', 'FFFF00', 'FFA500', 'FF0000'];
+Map.addLayer(probability, {min: 0, max: 1, palette: probabilityPalette}, 'Landslide Probability (RF)');
+
+// STEP 15: Export result as GeoTIFF
+Export.image.toDrive({
+    image: maskedReclass.toInt8(),
+    description: 'Landslide_RF_5Class_Improved_Distance',
+    folder: 'GEE_Exports',
+    fileNamePrefix: 'Nilgiris_RF_LSI_Improved_Distance',
+    region: boundary.geometry(),
+    scale: 30,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13
+});
